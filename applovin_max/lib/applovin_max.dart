@@ -559,12 +559,72 @@ class AppLovinMAX {
     _interstitialListener = listener;
   }
 
+  /// Reserves an idle Android interstitial; load must begin within 5 seconds.
+  ///
+  /// Returns an opaque attempt identifier, not ad-request authorization. Pass it
+  /// as attemptId to explicit load/show calls. The pre-load expiry does not expire
+  /// a successfully loaded ad. Explicit retirement, host loss and SDK replacement
+  /// invalidate showing permission. No preparation or bid-freshness grant is made.
+  /// Rejections propagate as PlatformException; unsupported platforms reject locally.
+  static Future<String> reserveInterstitial(String adUnitId) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      throw UnsupportedError('Interstitial reservation is Android-only.');
+    }
+    final String? attempt = await _methodChannel.invokeMethod<String>(
+      'reserveInterstitial',
+      {'ad_unit_id': adUnitId},
+    );
+    if (attempt == null || attempt.isEmpty) {
+      throw PlatformException(
+        code: 'INVALID_RESERVATION_RESPONSE',
+        message: 'MAX did not return an interstitial reservation.',
+      );
+    }
+    return attempt;
+  }
+
+  /// Invalidates and retires the exact coordinated attempt on Android.
+  ///
+  /// True acknowledges listener detachment and destroy() returning successfully.
+  /// False means cleanup is deferred for presentation callbacks or is already
+  /// in progress. It does not promise cancellation. Cleanup failure
+  /// is a PlatformException and keeps the ID blocked. Repeated completed retirement
+  /// is idempotent until a replacement generation or engine epoch is established.
+  static Future<bool> retireInterstitial(
+    String adUnitId, {
+    required String attemptId,
+  }) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      throw UnsupportedError('Interstitial retirement is Android-only.');
+    }
+    final bool? retired = await _methodChannel.invokeMethod<bool>(
+      'retireInterstitial',
+      {'ad_unit_id': adUnitId, 'attempt_id': attemptId},
+    );
+    if (retired == null) {
+      throw PlatformException(
+        code: 'INVALID_RETIREMENT_RESPONSE',
+        message: 'MAX did not return a retirement acknowledgement.',
+      );
+    }
+    return retired;
+  }
+
   /// Loads an interstitial ad using your [adUnitId].
   ///
   /// [Loading an Interstitial Ad](https://developers.applovin.com/en/flutter/ad-formats/interstitial-ads#loading-an-interstitial-ad)
-  static void loadInterstitial(String adUnitId) {
-    _methodChannel.invokeMethod('loadInterstitial', {
+  /// Await the dispatch acknowledgement to observe a coordinated rejection.
+  /// Omitting attemptId preserves ordinary arguments for uncoordinated units.
+  static Future<void> loadInterstitial(String adUnitId, {String? attemptId}) {
+    if (attemptId != null &&
+        (kIsWeb || defaultTargetPlatform != TargetPlatform.android)) {
+      return Future<void>.error(
+        UnsupportedError('Coordinated interstitials are Android-only.'),
+      );
+    }
+    return _methodChannel.invokeMethod<void>('loadInterstitial', {
       'ad_unit_id': adUnitId,
+      if (attemptId != null) 'attempt_id': attemptId,
     });
   }
 
@@ -578,11 +638,24 @@ class AppLovinMAX {
   /// Shows the interstitial ad with the specified [adUnitId].
   ///
   /// [Showing an Interstitial Ad](https://developers.applovin.com/en/flutter/ad-formats/interstitial-ads#showing-an-interstitial-ad)
-  static void showInterstitial(String adUnitId, {String? placement, String? customData}) {
-    _methodChannel.invokeMethod('showInterstitial', {
+  /// This acknowledges native dispatch, not a successful ad presentation.
+  static Future<void> showInterstitial(
+    String adUnitId, {
+    String? placement,
+    String? customData,
+    String? attemptId,
+  }) {
+    if (attemptId != null &&
+        (kIsWeb || defaultTargetPlatform != TargetPlatform.android)) {
+      return Future<void>.error(
+        UnsupportedError('Coordinated interstitials are Android-only.'),
+      );
+    }
+    return _methodChannel.invokeMethod<void>('showInterstitial', {
       'ad_unit_id': adUnitId,
       'placement': placement,
       'custom_data': customData,
+      if (attemptId != null) 'attempt_id': attemptId,
     });
   }
 

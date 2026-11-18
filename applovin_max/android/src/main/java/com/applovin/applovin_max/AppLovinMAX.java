@@ -5,6 +5,10 @@ import android.content.Context;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
+import android.os.Looper;
+import android.os.Handler;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -105,6 +109,7 @@ public class AppLovinMAX
     private MethodChannel         sharedChannel;
     private Context               applicationContext;
     private ActivityPluginBinding lastActivityPluginBinding;
+    private Activity reservationActivity;
 
     // Parent Fields
     private AppLovinSdk              sdk;
@@ -119,6 +124,11 @@ public class AppLovinMAX
 
     // Fullscreen Ad Fields
     private final Map<String, MaxInterstitialAd> mInterstitials = new HashMap<>( 2 );
+    private final InterstitialReservationRegistry interstitialReservations =
+            new InterstitialReservationRegistry( SystemClock::elapsedRealtime );
+    private final InterstitialRetirement interstitialRetirement =
+            new InterstitialRetirement( interstitialReservations, this::destroyRetiredInterstitial );
+    private final Handler interstitialCleanupHandler = new Handler( Looper.getMainLooper() );
     private final Map<String, MaxRewardedAd>     mRewardedAds   = new HashMap<>( 2 );
     private final Map<String, MaxAppOpenAd>      mAppOpenAds    = new HashMap<>( 2 );
 
@@ -160,6 +170,7 @@ public class AppLovinMAX
         //
         // instance = this;
 
+        interstitialReservations.attach();
         applicationContext = binding.getApplicationContext();
 
         sdk = AppLovinSdk.getInstance( applicationContext );
@@ -177,6 +188,9 @@ public class AppLovinMAX
     @Override
     public void onDetachedFromEngine(@NonNull final FlutterPluginBinding binding)
     {
+        interstitialReservations.detach();
+        cleanupRequestedInterstitials();
+        reservationActivity = null;
         sharedChannel.setMethodCallHandler( null );
     }
 
@@ -551,20 +565,257 @@ public class AppLovinMAX
 
     public void loadInterstitial(final String adUnitId)
     {
-        MaxInterstitialAd interstitial = retrieveInterstitial( adUnitId );
-        interstitial.loadAd();
+        loadInterstitial( adUnitId, null );
+    }
+
+    public void loadInterstitial(final String adUnitId, @Nullable final String attemptId)
+    {
+        try { dispatchInterstitialLoad( adUnitId, attemptId ); }
+        finally { cleanupRequestedInterstitials(); }
+    }
+
+    private void dispatchInterstitialLoad(final String adUnitId, @Nullable final String attemptId)
+    {
+        requireInterstitialHost( adUnitId, attemptId );
+        MaxInterstitialAd interstitial = operationInterstitial( adUnitId, attemptId );
+        InterstitialReservationRegistry.Binding binding = interstitialReservations.binding( adUnitId, interstitial );
+        interstitialReservations.validateLoad( adUnitId, interstitial, attemptId );
+        if ( interstitialReservations.isCoordinated( adUnitId ) && readInterstitialReady( adUnitId, interstitial ) )
+        {
+            interstitialReservations.markUnsafe( binding );
+            throw new InterstitialReservationRegistry.Rejected( "INTERSTITIAL_BUSY" );
+        }
+        interstitialReservations.beforeLoad( adUnitId, interstitial, attemptId );
+        try { interstitial.loadAd(); }
+        catch ( Exception error ) { interstitialReservations.markUnsafe( binding ); throw error; }
+    }
+
+    private void retireInterstitial(final MethodCall call, final Result result)
+    {
+        Map<?, ?> args = call.arguments instanceof Map ? (Map<?, ?>) call.arguments : null;
+        Object id = args == null ? null : args.get( "ad_unit_id" );
+        Object attempt = args == null ? null : args.get( "attempt_id" );
+        if ( !(id instanceof String) || ((String) id).isEmpty()
+                || !(attempt instanceof String) || ((String) attempt).isEmpty() )
+        {
+            result.error( "INVALID_ARGUMENT", "An ad unit ID and attempt ID are required.", null );
+            return;
+        }
+        if ( Looper.myLooper() != Looper.getMainLooper() )
+        {
+            result.error( "RESERVATION_UNSAFE", "Retirement requires the platform thread.", null );
+            return;
+        }
+        try { result.success( interstitialRetirement.retire( (String) id, (String) attempt ) ); }
+        catch ( InterstitialReservationRegistry.Rejected rejected )
+        {
+            result.error( rejected.code, "Interstitial retirement rejected or cleanup failed.", null );
+        }
+    }
+
+    private void destroyRetiredInterstitial(final InterstitialReservationRegistry.Binding binding)
+    {
+        // Only the claimed exact generation may be touched. No lookup-based SDK destruction.
+        if ( Looper.myLooper() != Looper.getMainLooper() ) throw new IllegalStateException( "Platform thread required" );
+        MaxInterstitialAd ad = (MaxInterstitialAd) binding.object;
+        ad.setListener( null );
+        ad.setRevenueListener( null );
+        ad.setExpirationListener( null );
+        ad.destroy();
+        if ( mInterstitials.get( binding.adUnitId ) == ad ) mInterstitials.remove( binding.adUnitId );
+    }
+
+    private void cleanupRequestedInterstitials()
+    {
+        if ( Looper.myLooper() != Looper.getMainLooper() )
+        {
+            interstitialCleanupHandler.post( this::cleanupRequestedInterstitials );
+            return;
+        }
+        for ( InterstitialReservationRegistry.Binding binding : interstitialReservations.pendingCleanup() )
+        {
+            try { interstitialRetirement.cleanup( binding ); }
+            catch ( InterstitialReservationRegistry.Rejected ignored ) { /* Quarantined; never retried. */ }
+        }
+    }
+
+    private void scheduleInterstitialCleanup(final InterstitialReservationRegistry.Binding binding)
+    {
+        if ( !interstitialReservations.retirementPending( binding ) ) return;
+        // One platform-loop turn, not a timer or proof of completion. Registry checks the receipts.
+        interstitialCleanupHandler.post( () -> {
+            try { interstitialRetirement.cleanup( binding ); }
+            catch ( InterstitialReservationRegistry.Rejected ignored ) { /* Quarantined; never retried. */ }
+        } );
+    }
+
+    private MaxInterstitialAd operationInterstitial(final String adUnitId, @Nullable final String attemptId)
+    {
+        if ( attemptId != null )
+        {
+            MaxInterstitialAd existing = mInterstitials.get( adUnitId );
+            if ( existing == null ) throw new InterstitialReservationRegistry.Rejected( "STALE_ATTEMPT" );
+            return existing;
+        }
+        if ( !mInterstitials.containsKey( adUnitId ) && interstitialReservations.isCoordinated( adUnitId ) )
+            throw new InterstitialReservationRegistry.Rejected( "RESERVATION_UNSAFE" );
+        return retrieveInterstitial( adUnitId );
+    }
+
+    private void requireInterstitialHost(final String adUnitId, @Nullable final String attemptId)
+    {
+        if ( attemptId == null && !interstitialReservations.isCoordinated( adUnitId ) ) return;
+        if ( Looper.myLooper() != Looper.getMainLooper() )
+            throw new InterstitialReservationRegistry.Rejected( "RESERVATION_UNSAFE" );
+        if ( !interstitialReservations.isAttached() )
+            throw new InterstitialReservationRegistry.Rejected( "ENGINE_DETACHED" );
+        if ( !isPluginInitialized || !isSdkInitialized || sdk == null )
+            throw new InterstitialReservationRegistry.Rejected( "MAX_NOT_INITIALIZED" );
+        Activity activity = reservationActivity;
+        if ( activity == null || activity != getCurrentActivity() || activity.isFinishing()
+                || (Build.VERSION.SDK_INT >= 17 && activity.isDestroyed()) )
+        {
+            interstitialReservations.markUnsafe( adUnitId );
+            throw new InterstitialReservationRegistry.Rejected( "NO_ACTIVITY" );
+        }
+    }
+
+    private void handleInterstitialOperation(final MethodCall call, final Result result, final boolean show)
+    {
+        Map<?, ?> args = call.arguments instanceof Map ? (Map<?, ?>) call.arguments : null;
+        Object id = args == null ? null : args.get( "ad_unit_id" );
+        Object attempt = args == null ? null : args.get( "attempt_id" );
+        Object placement = args == null ? null : args.get( "placement" );
+        Object customData = args == null ? null : args.get( "custom_data" );
+        if ( !(id instanceof String) || ((String) id).isEmpty()
+                || (attempt != null && (!(attempt instanceof String) || ((String) attempt).isEmpty()))
+                || (show && ((placement != null && !(placement instanceof String))
+                    || (customData != null && !(customData instanceof String)))) )
+        {
+            result.error( "INVALID_ARGUMENT", "Invalid interstitial operation arguments.", null );
+            return;
+        }
+        try
+        {
+            if ( show ) showInterstitial( (String) id, (String) placement, (String) customData, (String) attempt );
+            else loadInterstitial( (String) id, (String) attempt );
+            result.success( null ); // Dispatch acknowledgement, never ad load/display success.
+        }
+        catch ( InterstitialReservationRegistry.Rejected rejected )
+        {
+            result.error( rejected.code, "Interstitial operation rejected.", null );
+        }
+        catch ( Exception ignored )
+        {
+            result.error( "INTERSTITIAL_OPERATION_FAILED", "MAX operation could not be dispatched.", null );
+        }
+    }
+
+    // EXT-A1.1: creates at most the normal cached plugin object; never initializes or loads MAX.
+    private void reserveInterstitial(final MethodCall call, final Result result)
+    {
+        if ( Looper.myLooper() != Looper.getMainLooper() )
+        {
+            result.error( "RESERVATION_UNSAFE", "Reservation requires the platform thread.", null );
+            return;
+        }
+        Object argument = call.arguments instanceof Map ? ((Map<?, ?>) call.arguments).get( "ad_unit_id" ) : null;
+        if ( !(argument instanceof String) || !((String) argument).matches( "[A-Za-z0-9][A-Za-z0-9_-]{0,127}" ) )
+        {
+            result.error( "INVALID_ARGUMENT", "A valid interstitial ad unit ID is required.", null );
+            return;
+        }
+        if ( !interstitialReservations.isAttached() )
+        {
+            result.error( "ENGINE_DETACHED", "An attached engine is required.", null );
+            return;
+        }
+        if ( !isPluginInitialized || !isSdkInitialized || sdk == null )
+        {
+            result.error( "MAX_NOT_INITIALIZED", "Publisher MAX initialization is required.", null );
+            return;
+        }
+        Activity activity = reservationActivity;
+        if ( activity == null || activity != getCurrentActivity() || activity.isFinishing()
+                || (Build.VERSION.SDK_INT >= 17 && activity.isDestroyed()) )
+        {
+            result.error( "NO_ACTIVITY", "An attached Activity is required.", null );
+            return;
+        }
+        try
+        {
+            String adUnitId = (String) argument;
+            if ( !mInterstitials.containsKey( adUnitId ) && interstitialReservations.isCoordinated( adUnitId ) )
+                throw new InterstitialReservationRegistry.Rejected( "RESERVATION_UNSAFE" );
+            MaxInterstitialAd interstitial = retrieveInterstitial( adUnitId );
+            result.success( interstitialReservations.reserve( adUnitId, interstitial, interstitial.isReady() ).id );
+        }
+        catch ( InterstitialReservationRegistry.Rejected rejected )
+        {
+            result.error( rejected.code, "Interstitial reservation rejected.", null );
+        }
+        catch ( Exception ignored )
+        {
+            interstitialReservations.markUnsafe( (String) argument );
+            result.error( "RESERVATION_UNSAFE", "Interstitial state could not be verified.", null );
+        }
+        finally { cleanupRequestedInterstitials(); }
     }
 
     public void isInterstitialReady(final String adUnitId, final Result result)
     {
+        if ( !mInterstitials.containsKey( adUnitId ) && interstitialReservations.isCoordinated( adUnitId ) )
+        {
+            result.success( false );
+            return;
+        }
         MaxInterstitialAd interstitial = retrieveInterstitial( adUnitId );
-        result.success( interstitial.isReady() );
+        try
+        {
+            result.success( interstitialReservations.canReportReady( adUnitId, interstitial,
+                    readInterstitialReady( adUnitId, interstitial ) ) );
+        }
+        catch ( Exception ignored )
+        {
+            result.error( "INTERSTITIAL_STATE_UNAVAILABLE", "MAX readiness could not be established.", null );
+        }
+        finally { cleanupRequestedInterstitials(); }
+    }
+
+    private boolean readInterstitialReady(final String adUnitId, final MaxInterstitialAd interstitial)
+    {
+        try { return interstitial.isReady(); }
+        catch ( Exception error )
+        {
+            interstitialReservations.markUnsafe( interstitialReservations.binding( adUnitId, interstitial ) );
+            throw error;
+        }
     }
 
     public void showInterstitial(final String adUnitId, final String placement, final String customData)
     {
-        MaxInterstitialAd interstitial = retrieveInterstitial( adUnitId );
-        interstitial.showAd( placement, customData );
+        showInterstitial( adUnitId, placement, customData, null );
+    }
+
+    public void showInterstitial(final String adUnitId, final String placement, final String customData,
+                                 @Nullable final String attemptId)
+    {
+        try { dispatchInterstitialShow( adUnitId, placement, customData, attemptId ); }
+        finally { cleanupRequestedInterstitials(); }
+    }
+
+    private void dispatchInterstitialShow(final String adUnitId, final String placement, final String customData,
+                                          @Nullable final String attemptId)
+    {
+        requireInterstitialHost( adUnitId, attemptId );
+        MaxInterstitialAd interstitial = operationInterstitial( adUnitId, attemptId );
+        InterstitialReservationRegistry.Binding binding = interstitialReservations.binding( adUnitId, interstitial );
+        // Ordinary calls retain upstream behavior; only coordinated calls corroborate readiness.
+        boolean ready = !interstitialReservations.isCoordinated( adUnitId )
+                || readInterstitialReady( adUnitId, interstitial );
+        interstitialReservations.beforeShow( adUnitId, interstitial, attemptId, ready );
+        try { interstitial.showAd( placement, customData ); }
+        catch ( Exception error ) { interstitialReservations.markUnsafe( binding ); throw error; }
     }
 
     public void setInterstitialExtraParameter(final String adUnitId, final String key, final String value)
@@ -1222,6 +1473,77 @@ public class AppLovinMAX
         Log.e( SDK_TAG, fullMessage );
     }
 
+    /** The sole plugin listener, bound once to the exact native object generation. */
+    private final class InterstitialCallbacks implements MaxAdListener, MaxAdRevenueListener
+    {
+        private final InterstitialReservationRegistry.Binding binding;
+        private final Handler callbackHandler = new Handler( Looper.getMainLooper() );
+
+        InterstitialCallbacks(InterstitialReservationRegistry.Binding binding)
+        {
+            this.binding = binding;
+        }
+
+        private void deliver(String id, @Nullable MaxAd ad,
+                             InterstitialReservationRegistry.Event event, Runnable forward)
+        {
+            Runnable delivery = () -> {
+                if ( !binding.adUnitId.equals( id ) || (ad != null && ad.getFormat() != MaxAdFormat.INTERSTITIAL) ) return;
+                boolean accepted = interstitialReservations.acceptCallback( binding, event );
+                // Forward terminal evidence before scheduling SDK cleanup.
+                try
+                {
+                    if ( accepted && interstitialReservations.canForwardToEngine( binding ) ) forward.run();
+                }
+                finally { scheduleInterstitialCleanup( binding ); }
+            };
+            if ( Looper.myLooper() == Looper.getMainLooper() ) delivery.run();
+            else callbackHandler.post( delivery );
+        }
+
+        @Override public void onAdLoaded(MaxAd ad)
+        {
+            deliver( ad.getAdUnitId(), ad, InterstitialReservationRegistry.Event.LOADED,
+                    () -> AppLovinMAX.this.onAdLoaded( ad ) );
+        }
+
+        @Override public void onAdLoadFailed(String id, MaxError error)
+        {
+            deliver( id, null, InterstitialReservationRegistry.Event.LOAD_FAILED,
+                    () -> AppLovinMAX.this.onAdLoadFailed( id, error ) );
+        }
+
+        @Override public void onAdDisplayed(MaxAd ad)
+        {
+            deliver( ad.getAdUnitId(), ad, InterstitialReservationRegistry.Event.DISPLAYED,
+                    () -> AppLovinMAX.this.onAdDisplayed( ad ) );
+        }
+
+        @Override public void onAdDisplayFailed(MaxAd ad, MaxError error)
+        {
+            deliver( ad.getAdUnitId(), ad, InterstitialReservationRegistry.Event.DISPLAY_FAILED,
+                    () -> AppLovinMAX.this.onAdDisplayFailed( ad, error ) );
+        }
+
+        @Override public void onAdHidden(MaxAd ad)
+        {
+            deliver( ad.getAdUnitId(), ad, InterstitialReservationRegistry.Event.HIDDEN,
+                    () -> AppLovinMAX.this.onAdHidden( ad ) );
+        }
+
+        @Override public void onAdClicked(MaxAd ad)
+        {
+            deliver( ad.getAdUnitId(), ad, InterstitialReservationRegistry.Event.CLICKED,
+                    () -> AppLovinMAX.this.onAdClicked( ad ) );
+        }
+
+        @Override public void onAdRevenuePaid(MaxAd ad)
+        {
+            deliver( ad.getAdUnitId(), ad, InterstitialReservationRegistry.Event.REVENUE,
+                    () -> AppLovinMAX.this.onAdRevenuePaid( ad ) );
+        }
+    }
+
     // NOTE: Do not update signature as some integrations depend on it via Java reflection
     private MaxInterstitialAd retrieveInterstitial(String adUnitId)
     {
@@ -1229,10 +1551,16 @@ public class AppLovinMAX
         if ( result == null )
         {
             result = new MaxInterstitialAd( adUnitId, sdk, getCurrentActivity() );
-            result.setListener( this );
-            result.setRevenueListener( this );
-
             mInterstitials.put( adUnitId, result );
+            interstitialReservations.created( adUnitId, result );
+            final InterstitialReservationRegistry.Binding binding = interstitialReservations.binding( adUnitId, result );
+            InterstitialCallbacks callbacks = new InterstitialCallbacks( binding );
+            result.setListener( callbacks );
+            result.setRevenueListener( callbacks );
+            result.setExpirationListener( (expired, replacement) -> {
+                interstitialReservations.markUnsafe( binding );
+                scheduleInterstitialCleanup( binding );
+            } );
         }
 
         return result;
@@ -1579,7 +1907,9 @@ public class AppLovinMAX
         if ( adFormat == MaxAdFormat.INTERSTITIAL )
         {
             MaxInterstitialAd interstitial = retrieveInterstitial( adUnitId );
+            interstitialReservations.markUnsafe( adUnitId );
             interstitial.setLocalExtraParameter( key, result );
+            scheduleInterstitialCleanup( interstitialReservations.binding( adUnitId, interstitial ) );
         }
         else if ( adFormat == MaxAdFormat.REWARDED )
         {
@@ -1993,12 +2323,17 @@ public class AppLovinMAX
 
             result.success( null );
         }
+        else if ( "reserveInterstitial".equals( call.method ) )
+        {
+            reserveInterstitial( call, result );
+        }
+        else if ( "retireInterstitial".equals( call.method ) )
+        {
+            retireInterstitial( call, result );
+        }
         else if ( "loadInterstitial".equals( call.method ) )
         {
-            String adUnitId = call.argument( "ad_unit_id" );
-            loadInterstitial( adUnitId );
-
-            result.success( null );
+            handleInterstitialOperation( call, result, false );
         }
         else if ( "isInterstitialReady".equals( call.method ) )
         {
@@ -2007,12 +2342,7 @@ public class AppLovinMAX
         }
         else if ( "showInterstitial".equals( call.method ) )
         {
-            String adUnitId = call.argument( "ad_unit_id" );
-            String placement = call.argument( "placement" );
-            String customData = call.argument( "custom_data" );
-            showInterstitial( adUnitId, placement, customData );
-
-            result.success( null );
+            handleInterstitialOperation( call, result, true );
         }
         else if ( "setInterstitialExtraParameter".equals( call.method ) )
         {
@@ -2167,14 +2497,21 @@ public class AppLovinMAX
         // Once the issue is resolved, we can check if we can move following one lines to onAttachedToEngine.
         instance = this;
         lastActivityPluginBinding = binding;
+        reservationActivity = binding.getActivity();
     }
 
     @Override
-    public void onDetachedFromActivityForConfigChanges() { }
+    public void onDetachedFromActivityForConfigChanges()
+    {
+        reservationActivity = null;
+        interstitialReservations.hostUnavailable();
+        cleanupRequestedInterstitials();
+    }
 
     @Override
     public void onReattachedToActivityForConfigChanges(@NonNull final ActivityPluginBinding binding)
     {
+        reservationActivity = binding.getActivity();
         // KNOWN ISSUE: onAttachedToEngine will be call twice, which may be caused by using
         // firebase_messaging plugin. See https://github.com/flutter/flutter/issues/97840
         // Once the issue is resolved, we can check if we can move following one lines to onAttachedToEngine.
@@ -2182,7 +2519,12 @@ public class AppLovinMAX
     }
 
     @Override
-    public void onDetachedFromActivity() { }
+    public void onDetachedFromActivity()
+    {
+        reservationActivity = null;
+        interstitialReservations.hostUnavailable();
+        cleanupRequestedInterstitials();
+    }
 
     private Activity getCurrentActivity()
     {
