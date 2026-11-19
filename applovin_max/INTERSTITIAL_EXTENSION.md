@@ -1,11 +1,11 @@
-# Android interstitial extension — EXT-A1.3
+# Android interstitial extension — EXT-A2
 
 This maintained 4.5.1 fork replaces the original Flutter MAX plugin. Native MAX
 remains 13.3.1. The plugin owns all native ad objects and forwards accepted events
 to the publisher's existing Dart listeners, including revenue attribution.
-No Prebid/Core dependency, preparation provider, response attachment or auction is
-implemented. Attempt identity and SDK initialization are not consent or legal
-advertising authorization.
+EXT-A2 adds a trusted native preparation boundary; the fork still has no Prebid/Core
+dependency or auction implementation. Attempt identity and SDK initialization are
+not consent or legal advertising authorization.
 
 ## Explicit operations
 
@@ -36,9 +36,9 @@ retirement, uncertain SDK state or MAX expired-ad replacement invalidates the
 attempt. An invalidated ad never becomes ordinary MAX-only on that retained
 object. Ordinary ID-only calls retain their upstream path on uncoordinated units.
 
-There are no cached bids in this checkpoint. Removing the preparation deadline
-from loaded-ad validity does NOT authorize unbounded future bid retention.
-EXT-A1.4 and any real demand coordinator must supply current authorization,
+The fork itself stores no cached bids. Removing the preparation deadline
+from loaded-ad validity does NOT authorize unbounded bid retention.
+The EXT-A2 native provider must supply current authorization,
 configuration revisions and its own bid freshness/expiry policy at the native
 load/show boundary. Invalidating a retained bid requires retirement, not reuse as
 ordinary MAX demand. This production authorization is not implemented here.
@@ -86,7 +86,39 @@ Engine/Activity detach invalidates coordinated work and cleans non-showing
 objects. Showing objects keep their native callback sink until terminal handling.
 Uncoordinated objects are not destroyed by this extension.
 
-## EXT-A1.4 native preparation provider — design only
+## EXT-A2 native preparation boundary — implemented, operator validation pending
+
+The host obtains this engine's AppLovinMAX plugin instance and calls
+attachInterstitialPreparation(id, attempt, preparation). It attaches at most one
+InterstitialPreparation to the current exact idle binding. PreparationAccess
+permits guarded, platform-thread writes to that reserved object via withCurrentObject.
+All asynchronous demand delegate writes MUST use that access; retaining the object
+and later writing directly violates this trusted-native contract.
+
+isAuthorized and isReady are checked immediately before coordinated native Load/Show.
+Exceptions fail closed. Exact binding/attempt/generation/epoch checks remain in the
+existing registry. A preparation cannot initialize MAX, load/show, construct a
+replacement or take publisher listeners. No provider registry or Dart object/cache
+API is added.
+
+The native preparation owns its response association/freshness and implements clear.
+Existing retirement invokes clear(exactObject) before detach/destroy/releasing the
+guard; cleanup failure uses the existing quarantine. Showing cleanup remains deferred.
+onEvent provides native observation while accepted publisher callbacks still forward
+normally. Provider event failures invalidate the attempt without suppressing legitimate
+publisher presentation receipts. Ordinary uncoordinated ID-only behavior is unchanged.
+
+onCallbackObserved is a diagnostic-only tap after the existing identity/format check
+and callback acceptance decision. It reports native receipt, acceptance and engine
+forwarding eligibility independently. Exceptions are ignored; diagnostics cannot
+change acceptance, publisher forwarding or retirement. A renderer's internal log
+does not synthesize a MAX callback.
+
+The Asterise debug acceptance fixture implements the Prebid-specific provider with
+3.4.1 and the approved test configuration. No new build, test or live rendering
+result is claimed for EXT-A2.
+
+## Earlier conceptual contract (superseded by EXT-A2 above)
 
 A minimal future provider needs the following conceptual interface, not a new
 owner and not a second Flutter MAX plugin:
@@ -107,7 +139,7 @@ no native object, cache ID or raw bid payload crosses Dart. A provider cannot
 initialize MAX, acquire another object/singleton, replace publisher listeners,
 grant consent or trigger loads/shows. A late completion cannot revive a retired
 generation. Uncertain provider cleanup must quarantine rather than release.
-Fake preparation comes first; real Prebid association requires separate approval.
+The project owner explicitly approved skipping standalone fake preparation for EXT-A2.
 
 ## Operator validation
 

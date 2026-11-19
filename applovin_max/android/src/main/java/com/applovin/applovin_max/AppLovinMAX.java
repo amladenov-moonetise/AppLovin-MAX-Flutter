@@ -132,6 +132,81 @@ public class AppLovinMAX
     private final Map<String, MaxRewardedAd>     mRewardedAds   = new HashMap<>( 2 );
     private final Map<String, MaxAppOpenAd>      mAppOpenAds    = new HashMap<>( 2 );
 
+    private final Map<InterstitialReservationRegistry.Binding, InterstitialPreparation> interstitialPreparations = new HashMap<>();
+
+    /** No registry/singleton installation: the host uses its engine's plugin instance. */
+    public PreparationAccess attachInterstitialPreparation(String id, String attempt,
+                                                          InterstitialPreparation preparation)
+    {
+        requireInterstitialHost( id, attempt );
+        MaxInterstitialAd ad = operationInterstitial( id, attempt );
+        interstitialReservations.validateLoad( id, ad, attempt );
+        InterstitialReservationRegistry.Binding binding = interstitialReservations.binding( id, ad );
+        if ( preparation == null || interstitialPreparations.containsKey( binding ) )
+            throw new IllegalStateException( "PREPARATION_ALREADY_ATTACHED" );
+        if ( !preparation.isAuthorized() ) throw new IllegalStateException( "PREPARATION_UNAUTHORIZED" );
+        interstitialPreparations.put( binding, preparation );
+        return new PreparationAccess( binding, attempt, preparation );
+    }
+
+    public final class PreparationAccess
+    {
+        private final InterstitialReservationRegistry.Binding binding;
+        private final String attempt;
+        private final InterstitialPreparation preparation;
+        private PreparationAccess(InterstitialReservationRegistry.Binding binding, String attempt,
+                                  InterstitialPreparation preparation)
+        { this.binding = binding; this.attempt = attempt; this.preparation = preparation; }
+
+        public boolean isCurrent()
+        {
+            return Looper.myLooper() == Looper.getMainLooper()
+                    && interstitialPreparations.get( binding ) == preparation
+                    && interstitialReservations.isCurrent( binding.adUnitId, binding.object, attempt,
+                                                           binding.generation, binding.epoch );
+        }
+
+        /** Delegate writes must always pass through this boundary; never retain/use the object later. */
+        public boolean withCurrentObject(java.util.function.Consumer<MaxInterstitialAd> write)
+        {
+            if ( !isCurrent() || !preparation.isAuthorized() ) return false;
+            requireInterstitialHost( binding.adUnitId, attempt );
+            interstitialReservations.validateLoad( binding.adUnitId, binding.object, attempt );
+            write.accept( (MaxInterstitialAd) binding.object );
+            return isCurrent();
+        }
+
+        public boolean retire()
+        {
+            if ( Looper.myLooper() != Looper.getMainLooper() ) throw new IllegalStateException( "Platform thread required" );
+            return interstitialRetirement.retire( binding.adUnitId, attempt );
+        }
+    }
+
+    private void requirePreparedInterstitial(InterstitialReservationRegistry.Binding binding)
+    {
+        InterstitialPreparation preparation = interstitialPreparations.get( binding );
+        if ( preparation == null ) return;
+        boolean valid;
+        try { valid = preparation.isAuthorized() && preparation.isReady(); }
+        catch ( Exception ignored ) { valid = false; }
+        if ( !valid )
+        {
+            interstitialReservations.markUnsafe( binding );
+            throw new IllegalStateException( "PREPARATION_INVALIDATED" );
+        }
+    }
+
+    private void preparationEvent(InterstitialReservationRegistry.Binding binding, String event, @Nullable MaxAd ad)
+    {
+        InterstitialPreparation preparation = interstitialPreparations.get( binding );
+        if ( preparation != null )
+        {
+            try { preparation.onEvent( event, ad ); }
+            catch ( Exception ignored ) { interstitialReservations.markUnsafe( binding ); }
+        }
+    }
+
     // AdView Fields
     private final Map<String, MaxAdView>   mAdViews                            = new HashMap<>( 2 );
     private final Map<String, MaxAdFormat> mAdViewAdFormats                    = new HashMap<>( 2 );
@@ -585,8 +660,11 @@ public class AppLovinMAX
             interstitialReservations.markUnsafe( binding );
             throw new InterstitialReservationRegistry.Rejected( "INTERSTITIAL_BUSY" );
         }
+        requirePreparedInterstitial( binding );
+        preparationEvent( binding, "LOAD_REQUESTED", null );
+        requirePreparedInterstitial( binding );
         interstitialReservations.beforeLoad( adUnitId, interstitial, attemptId );
-        try { interstitial.loadAd(); }
+        try { interstitial.loadAd(); preparationEvent( binding, "LOAD_DISPATCHED", null ); }
         catch ( Exception error ) { interstitialReservations.markUnsafe( binding ); throw error; }
     }
 
@@ -618,6 +696,12 @@ public class AppLovinMAX
         // Only the claimed exact generation may be touched. No lookup-based SDK destruction.
         if ( Looper.myLooper() != Looper.getMainLooper() ) throw new IllegalStateException( "Platform thread required" );
         MaxInterstitialAd ad = (MaxInterstitialAd) binding.object;
+        InterstitialPreparation preparation = interstitialPreparations.get( binding );
+        if ( preparation != null )
+        {
+            preparation.clear( ad ); // Failure propagates into existing cleanup quarantine.
+            interstitialPreparations.remove( binding );
+        }
         ad.setListener( null );
         ad.setRevenueListener( null );
         ad.setExpirationListener( null );
@@ -813,8 +897,11 @@ public class AppLovinMAX
         // Ordinary calls retain upstream behavior; only coordinated calls corroborate readiness.
         boolean ready = !interstitialReservations.isCoordinated( adUnitId )
                 || readInterstitialReady( adUnitId, interstitial );
+        requirePreparedInterstitial( binding );
+        preparationEvent( binding, "SHOW_REQUESTED", null );
+        requirePreparedInterstitial( binding );
         interstitialReservations.beforeShow( adUnitId, interstitial, attemptId, ready );
-        try { interstitial.showAd( placement, customData ); }
+        try { interstitial.showAd( placement, customData ); preparationEvent( binding, "SHOW_DISPATCHED", null ); }
         catch ( Exception error ) { interstitialReservations.markUnsafe( binding ); throw error; }
     }
 
@@ -1490,9 +1577,18 @@ public class AppLovinMAX
             Runnable delivery = () -> {
                 if ( !binding.adUnitId.equals( id ) || (ad != null && ad.getFormat() != MaxAdFormat.INTERSTITIAL) ) return;
                 boolean accepted = interstitialReservations.acceptCallback( binding, event );
+                // Diagnostic tap only. Never change acceptance, lifecycle or publisher delivery.
+                InterstitialPreparation observer = interstitialPreparations.get( binding );
+                if ( observer != null )
+                {
+                    try { observer.onCallbackObserved( event.name(), ad, accepted,
+                            interstitialReservations.canForwardToEngine( binding ) ); }
+                    catch ( Exception ignored ) { /* Diagnostics cannot change ad behavior. */ }
+                }
                 // Forward terminal evidence before scheduling SDK cleanup.
                 try
                 {
+                    if ( accepted ) preparationEvent( binding, event.name(), ad );
                     if ( accepted && interstitialReservations.canForwardToEngine( binding ) ) forward.run();
                 }
                 finally { scheduleInterstitialCleanup( binding ); }
