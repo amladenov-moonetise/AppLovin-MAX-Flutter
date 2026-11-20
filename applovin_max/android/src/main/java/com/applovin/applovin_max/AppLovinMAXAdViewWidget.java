@@ -22,6 +22,9 @@ class AppLovinMAXAdViewWidget
         implements MaxAdListener, MaxAdViewAdListener, MaxAdRevenueListener
 {
     private final MaxAdView adView;
+    private final AppLovinMAX owner;
+    private final boolean coordinated;
+    private boolean destroyed;
     private final boolean   shouldPreloadWidget;
 
     @Nullable
@@ -34,7 +37,16 @@ class AppLovinMAXAdViewWidget
 
     public AppLovinMAXAdViewWidget(final String adUnitId, final MaxAdFormat adFormat, final boolean isAdaptive, final boolean shouldPreloadWidget, final Context context)
     {
+        this(adUnitId, adFormat, isAdaptive, shouldPreloadWidget, context, AppLovinMAX.getInstance());
+    }
+
+    AppLovinMAXAdViewWidget(final String adUnitId, final MaxAdFormat adFormat, final boolean isAdaptive,
+                           final boolean shouldPreloadWidget, final Context context, final AppLovinMAX owner)
+    {
         super( context );
+        this.owner = owner;
+        coordinated = owner.bannerOperations.managed(adUnitId);
+        owner.bannerOperations.beforeCreate(adUnitId);
 
         this.shouldPreloadWidget = shouldPreloadWidget;
 
@@ -69,6 +81,7 @@ class AppLovinMAXAdViewWidget
         );
 
         adView.setLayoutParams( params );
+        owner.bannerOperations.bind(adUnitId, adView, adFormat, isAdaptive);
     }
 
     public MaxAdView getAdView()
@@ -91,10 +104,13 @@ class AppLovinMAXAdViewWidget
         adView.setCustomData( value );
     }
 
+    boolean isCoordinated() { return coordinated; }
+
     public void setAutoRefreshEnabled(final boolean enabled)
     {
         if ( enabled )
         {
+            if (coordinated) { adView.stopAutoRefresh(); return; }
             adView.startAutoRefresh();
         }
         else
@@ -133,19 +149,38 @@ class AppLovinMAXAdViewWidget
         containerView = view;
     }
 
+    void requireMountOwner(AppLovinMAX candidate) {
+        if (coordinated && (owner != candidate || !owner.bannerOperations.callbackAllowed(adView, true)))
+            throw new IllegalStateException("BANNER_STALE_VIEW");
+    }
+
     public void detachAdView()
     {
         containerView = null;
+        if (coordinated && !destroyed) owner.bannerOperations.invalidateView(adView);
     }
 
-    public void loadAd()
+    public void initialLoad()
     {
+        if (!owner.bannerOperations.deferInitialLoad(adView)) loadAd();
+    }
+
+    public void loadAd() { loadAd(null); }
+
+    public void loadAd(String bannerAttemptId)
+    {
+        owner.bannerOperations.beforeLoad(adView, bannerAttemptId);
         adView.loadAd();
+        owner.bannerOperations.afterLoad(adView);
+        if (coordinated) adView.stopAutoRefresh();
     }
 
     public void destroy()
     {
+        if (destroyed) return;
+        destroyed = true;
         detachAdView();
+        owner.bannerOperations.release(adView);
 
         adView.setListener( null );
         adView.setRevenueListener( null );
@@ -155,14 +190,16 @@ class AppLovinMAXAdViewWidget
     @Override
     public void onAdLoaded(@NonNull final MaxAd ad)
     {
-        Map<String, Object> params = AppLovinMAX.getInstance().getAdInfo( ad );
+        if (!owner.bannerOperations.callbackAllowed(adView, coordinated)) return;
+        owner.bannerOperations.complete(adView, ad);
+        Map<String, Object> params = owner.getAdInfo( ad );
         params.put( "adViewId", hashCode() );
 
         if ( shouldPreloadWidget )
         {
             // Copy the `params` for the next sending, as they are consumed (i.e., released) by
             // `MethodChannel.invokeMethod()` through `fireCallback()`.
-            AppLovinMAX.getInstance().fireCallback( "OnWidgetAdViewAdLoadedEvent", Map.copyOf( params ) );
+            owner.fireCallback( "OnWidgetAdViewAdLoadedEvent", Map.copyOf( params ) );
         }
 
         if ( containerView != null )
@@ -174,14 +211,16 @@ class AppLovinMAXAdViewWidget
     @Override
     public void onAdLoadFailed(@NonNull final String adUnitId, @NonNull final MaxError error)
     {
-        Map<String, Object> params = AppLovinMAX.getInstance().getAdLoadFailedInfo( adUnitId, error );
+        if (!owner.bannerOperations.callbackAllowed(adView, coordinated)) return;
+        owner.bannerOperations.complete(adView, null);
+        Map<String, Object> params = owner.getAdLoadFailedInfo( adUnitId, error );
         params.put( "adViewId", hashCode() );
 
         if ( shouldPreloadWidget )
         {
             // Copy the `params` for the next sending, as they are consumed (i.e., released) by
             // `MethodChannel.invokeMethod()` through `fireCallback()`.
-            AppLovinMAX.getInstance().fireCallback( "OnWidgetAdViewAdLoadFailedEvent", Map.copyOf( params ) );
+            owner.fireCallback( "OnWidgetAdViewAdLoadFailedEvent", Map.copyOf( params ) );
         }
 
         if ( containerView != null )
@@ -193,9 +232,10 @@ class AppLovinMAXAdViewWidget
     @Override
     public void onAdClicked(@NonNull final MaxAd ad)
     {
+        if (!owner.bannerOperations.callbackAllowed(adView, coordinated)) return;
         if ( containerView != null )
         {
-            Map<String, Object> params = AppLovinMAX.getInstance().getAdInfo( ad );
+            Map<String, Object> params = owner.getAdInfo( ad );
             params.put( "adViewId", hashCode() );
 
             containerView.sendEvent( "OnAdViewAdClickedEvent", params );
@@ -205,9 +245,10 @@ class AppLovinMAXAdViewWidget
     @Override
     public void onAdExpanded(@NonNull final MaxAd ad)
     {
+        if (!owner.bannerOperations.callbackAllowed(adView, coordinated)) return;
         if ( containerView != null )
         {
-            Map<String, Object> params = AppLovinMAX.getInstance().getAdInfo( ad );
+            Map<String, Object> params = owner.getAdInfo( ad );
             params.put( "adViewId", hashCode() );
 
             containerView.sendEvent( "OnAdViewAdExpandedEvent", params );
@@ -217,9 +258,10 @@ class AppLovinMAXAdViewWidget
     @Override
     public void onAdCollapsed(@NonNull final MaxAd ad)
     {
+        if (!owner.bannerOperations.callbackAllowed(adView, coordinated)) return;
         if ( containerView != null )
         {
-            Map<String, Object> params = AppLovinMAX.getInstance().getAdInfo( ad );
+            Map<String, Object> params = owner.getAdInfo( ad );
             params.put( "adViewId", hashCode() );
 
             containerView.sendEvent( "OnAdViewAdCollapsedEvent", params );
@@ -229,9 +271,10 @@ class AppLovinMAXAdViewWidget
     @Override
     public void onAdRevenuePaid(@NonNull final MaxAd ad)
     {
+        if (!owner.bannerOperations.callbackAllowed(adView, coordinated)) return;
         if ( containerView != null )
         {
-            Map<String, Object> params = AppLovinMAX.getInstance().getAdInfo( ad );
+            Map<String, Object> params = owner.getAdInfo( ad );
             params.put( "adViewId", hashCode() );
 
             containerView.sendEvent( "OnAdViewAdRevenuePaidEvent", params );

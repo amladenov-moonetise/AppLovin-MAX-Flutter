@@ -21,12 +21,14 @@ public class AppLovinMAXAdViewFactory
         extends PlatformViewFactory
 {
     private final BinaryMessenger messenger;
+    private final AppLovinMAX owner;
 
-    public AppLovinMAXAdViewFactory(final BinaryMessenger messenger)
+    public AppLovinMAXAdViewFactory(final BinaryMessenger messenger, final AppLovinMAX owner)
     {
         super( StandardMessageCodec.INSTANCE );
 
         this.messenger = messenger;
+        this.owner = owner;
     }
 
     @NonNull
@@ -49,6 +51,6 @@ public class AppLovinMAXAdViewFactory
         Map<String, Object> extraParameters = params.containsKey( "extra_parameters" ) ? (Map<String, Object>) params.get( "extra_parameters" ) : null;
         Map<String, Object> localExtraParameters = params.containsKey( "local_extra_parameters" ) ? (Map<String, Object>) params.get( "local_extra_parameters" ) : null;
 
-        return new AppLovinMAXAdView( viewId, adUnitId, adViewId, adFormat, isAdaptiveBannerEnabled, isAutoRefreshEnabled, placement, customData, extraParameters, localExtraParameters, messenger, context );
+        return new AppLovinMAXAdView( viewId, adUnitId, adViewId, adFormat, isAdaptiveBannerEnabled, isAutoRefreshEnabled, placement, customData, extraParameters, localExtraParameters, messenger, context, owner );
     }
 }

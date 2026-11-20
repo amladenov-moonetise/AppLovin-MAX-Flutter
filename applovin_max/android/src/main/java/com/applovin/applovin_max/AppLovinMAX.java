@@ -130,6 +130,7 @@ public class AppLovinMAX
             new InterstitialRetirement( interstitialReservations, this::destroyRetiredInterstitial );
     private final Handler interstitialCleanupHandler = new Handler( Looper.getMainLooper() );
     private final Map<String, MaxRewardedAd>     mRewardedAds   = new HashMap<>( 2 );
+    private final RewardedOperations rewardedOperations = new RewardedOperations( this, mRewardedAds );
     private final Map<String, MaxAppOpenAd>      mAppOpenAds    = new HashMap<>( 2 );
 
     private final Map<InterstitialReservationRegistry.Binding, InterstitialPreparation> interstitialPreparations = new HashMap<>();
@@ -207,6 +208,22 @@ public class AppLovinMAX
         }
     }
 
+    // Opt-in banner coordination. The publisher must register BEFORE creating its view.
+    final BannerOperations bannerOperations = new BannerOperations();
+    public void registerBannerPreparation(String id, BannerPreparation provider) {
+        requireRewardedHost(); // Shared existing main-thread/engine/Activity/MAX readiness checks only.
+        if (mAdViews.containsKey(id) || AppLovinMAXAdView.getInstance(id) != null)
+            throw new IllegalStateException("BANNER_REGISTER_BEFORE_CREATE");
+        bannerOperations.register(id, provider);
+    }
+    public void unregisterBannerPreparation(String id, BannerPreparation provider) {
+        bannerOperations.unregister(id, provider);
+    }
+
+    public void abandonBannerPreparation(String id, BannerPreparation provider) {
+        bannerOperations.abandon(id, provider);
+    }
+
     // AdView Fields
     private final Map<String, MaxAdView>   mAdViews                            = new HashMap<>( 2 );
     private final Map<String, MaxAdFormat> mAdViewAdFormats                    = new HashMap<>( 2 );
@@ -246,6 +263,8 @@ public class AppLovinMAX
         // instance = this;
 
         interstitialReservations.attach();
+        rewardedOperations.attach();
+        bannerOperations.attach();
         applicationContext = binding.getApplicationContext();
 
         sdk = AppLovinSdk.getInstance( applicationContext );
@@ -253,7 +272,7 @@ public class AppLovinMAX
         sharedChannel = new MethodChannel( binding.getBinaryMessenger(), "applovin_max" );
         sharedChannel.setMethodCallHandler( this );
 
-        AppLovinMAXAdViewFactory adViewFactory = new AppLovinMAXAdViewFactory( binding.getBinaryMessenger() );
+        AppLovinMAXAdViewFactory adViewFactory = new AppLovinMAXAdViewFactory( binding.getBinaryMessenger(), this );
         binding.getPlatformViewRegistry().registerViewFactory( "applovin_max/adview", adViewFactory );
 
         AppLovinMAXNativeAdViewFactory nativeAdViewFactory = new AppLovinMAXNativeAdViewFactory( binding.getBinaryMessenger() );
@@ -264,6 +283,8 @@ public class AppLovinMAX
     public void onDetachedFromEngine(@NonNull final FlutterPluginBinding binding)
     {
         interstitialReservations.detach();
+        rewardedOperations.detach();
+        bannerOperations.detach();
         cleanupRequestedInterstitials();
         reservationActivity = null;
         sharedChannel.setMethodCallHandler( null );
@@ -562,6 +583,10 @@ public class AppLovinMAX
     public void loadBanner(final String adUnitId)
     {
         loadAdView( adUnitId, getDeviceSpecificBannerAdViewAdFormat() );
+    }
+    public void loadBanner(final String adUnitId, final String bannerAttemptId)
+    {
+        loadAdView(adUnitId, getDeviceSpecificBannerAdViewAdFormat(), bannerAttemptId);
     }
 
     public void startBannerAutoRefresh(final String adUnitId)
@@ -913,26 +938,88 @@ public class AppLovinMAX
 
     // REWARDED
 
-    public void loadRewardedAd(final String adUnitId)
+    public String reserveRewardedAd(String adUnitId) { return rewardedOperations.reserve( adUnitId ); }
+    public boolean retireRewardedAd(String adUnitId, String attemptId)
+    { return rewardedOperations.retire( adUnitId, attemptId ); }
+
+    public final class RewardedPreparationAccess
     {
-        MaxRewardedAd rewardedAd = retrieveRewardedAd( adUnitId );
-        rewardedAd.loadAd();
+        private final RewardedOperations.Access access;
+        private RewardedPreparationAccess(RewardedOperations.Access access) { this.access = access; }
+        public boolean isCurrent() { return access.isCurrent(); }
+        public boolean withCurrentObject(java.util.function.Consumer<MaxRewardedAd> write)
+        { return access.withCurrentObject( write ); }
+        public boolean retire() { return access.retire(); }
+        public boolean invalidate() { return access.invalidate(); }
     }
+
+    public RewardedPreparationAccess attachRewardedPreparation(String id, String attempt, RewardedPreparation preparation)
+    { return new RewardedPreparationAccess( rewardedOperations.prepare( id, attempt, preparation ) ); }
+
+    // Called only by this plugin's object owner. Never called by demand code.
+    MaxRewardedAd createRewardedObject(String id)
+    { return MaxRewardedAd.getInstance( id, sdk, getCurrentActivity() ); }
+
+    void requireRewardedHost()
+    {
+        if ( Looper.myLooper() != Looper.getMainLooper() || !isPluginInitialized || !isSdkInitialized || sdk == null )
+            throw new IllegalStateException( "REWARDED_HOST_NOT_READY" );
+        Activity activity = reservationActivity;
+        if ( activity == null || activity != getCurrentActivity() || activity.isFinishing() || activity.isDestroyed() )
+            throw new IllegalStateException( "REWARDED_NO_ACTIVITY" );
+    }
+
+    public void loadRewardedAd(final String adUnitId) { loadRewardedAd( adUnitId, null ); }
+    public void loadRewardedAd(final String adUnitId, @Nullable final String attemptId)
+    { rewardedOperations.load( adUnitId, attemptId ); }
 
     public void isRewardedAdReady(final String adUnitId, final Result result)
     {
-        MaxRewardedAd rewardedAd = retrieveRewardedAd( adUnitId );
-        result.success( rewardedAd.isReady() );
+        result.success( rewardedOperations.isReady( adUnitId ) );
     }
 
     public void showRewardedAd(final String adUnitId, final String placement, final String customData)
     {
-        MaxRewardedAd rewardedAd = retrieveRewardedAd( adUnitId );
-        rewardedAd.showAd( placement, customData );
+        showRewardedAd( adUnitId, placement, customData, null );
+    }
+
+    public void showRewardedAd(final String adUnitId, final String placement, final String customData,
+                               @Nullable final String attemptId)
+    { rewardedOperations.show( adUnitId, placement, customData, attemptId ); }
+
+    private void handleRewardedOperation(MethodCall call, Result result)
+    {
+        try
+        {
+            Object argument = call.argument( "ad_unit_id" );
+            Object attempt = call.argument( "attempt_id" );
+            if ( !(argument instanceof String) || ((String) argument).isEmpty()
+                    || (attempt != null && (!(attempt instanceof String) || ((String) attempt).isEmpty())) )
+                throw new IllegalArgumentException( "INVALID_ARGUMENT" );
+            String id = (String) argument;
+            if ( "reserveRewardedAd".equals( call.method ) ) result.success( reserveRewardedAd( id ) );
+            else if ( "retireRewardedAd".equals( call.method ) )
+            {
+                if ( attempt == null ) throw new IllegalArgumentException( "ATTEMPT_REQUIRED" );
+                result.success( retireRewardedAd( id, (String) attempt ) );
+            }
+            else if ( "isRewardedAdReady".equals( call.method ) ) result.success( rewardedOperations.isReady( id ) );
+            else
+            {
+                if ( "loadRewardedAd".equals( call.method ) ) loadRewardedAd( id, (String) attempt );
+                else showRewardedAd( id, call.argument( "placement" ), call.argument( "custom_data" ), (String) attempt );
+                result.success( null );
+            }
+        }
+        catch ( RewardedReservationRegistry.Rejected rejected )
+        { result.error( rejected.code, "Rewarded operation rejected by the attempt guard.", null ); }
+        catch ( Exception ignored )
+        { result.error( "REWARDED_OPERATION_REJECTED", "Rewarded operation rejected or cleanup uncertain.", null ); }
     }
 
     public void setRewardedAdExtraParameter(final String adUnitId, final String key, final String value)
     {
+        rewardedOperations.requireUncoordinated( adUnitId );
         MaxRewardedAd rewardedAd = retrieveRewardedAd( adUnitId );
         rewardedAd.setExtraParameter( key, value );
     }
@@ -1263,7 +1350,7 @@ public class AppLovinMAX
             positionAdView( adUnitId, adFormat );
         }
 
-        adView.loadAd();
+        if ( !bannerOperations.deferInitialLoad( adView ) ) adView.loadAd();
 
         // Disable auto-refresh if publisher sets it before creating the ad view.
         if ( mDisabledAutoRefreshAdViewAdUnitIds.contains( adUnitId ) )
@@ -1281,6 +1368,10 @@ public class AppLovinMAX
 
     private void loadAdView(final String adUnitId, final MaxAdFormat adFormat)
     {
+        loadAdView(adUnitId, adFormat, null);
+    }
+    private void loadAdView(final String adUnitId, final MaxAdFormat adFormat, final String bannerAttemptId)
+    {
         MaxAdView adView = retrieveAdView( adUnitId, adFormat );
         if ( adView == null )
         {
@@ -1288,7 +1379,7 @@ public class AppLovinMAX
             return;
         }
 
-        if ( !mDisabledAutoRefreshAdViewAdUnitIds.contains( adUnitId ) )
+        if ( !bannerOperations.managed( adUnitId ) && !mDisabledAutoRefreshAdViewAdUnitIds.contains( adUnitId ) )
         {
             if ( adView.getVisibility() != View.VISIBLE )
             {
@@ -1300,13 +1391,17 @@ public class AppLovinMAX
             return;
         }
 
+        bannerOperations.beforeLoad( adView, bannerAttemptId );
         adView.loadAd();
+        bannerOperations.afterLoad( adView );
+        if ( bannerOperations.managed( adUnitId ) ) adView.stopAutoRefresh();
     }
 
     private void startAdViewAutoRefresh(final String adUnitId, final MaxAdFormat adFormat)
     {
         d( "Starting " + adFormat.getLabel() + " auto refresh for ad unit identifier \"" + adUnitId + "\"" );
 
+        if ( bannerOperations.managed( adUnitId ) ) throw new IllegalStateException( "BANNER_EXPLICIT_REFRESH_REQUIRED" );
         mDisabledAutoRefreshAdViewAdUnitIds.remove( adUnitId );
 
         MaxAdView adView = retrieveAdView( adUnitId, adFormat );
@@ -1397,7 +1492,9 @@ public class AppLovinMAX
             return;
         }
 
+        bannerOperations.beforeShow(adView);
         adView.setVisibility( View.VISIBLE );
+        if ( bannerOperations.managed( adUnitId ) ) { adView.stopAutoRefresh(); return; }
         adView.startAutoRefresh();
 
         if ( !mDisabledAutoRefreshAdViewAdUnitIds.contains( adUnitId ) )
@@ -1439,6 +1536,7 @@ public class AppLovinMAX
             ( (ViewGroup) parent ).removeView( adView );
         }
 
+        bannerOperations.release( adView );
         adView.setListener( null );
         adView.setRevenueListener( null );
         adView.destroy();
@@ -1665,17 +1763,7 @@ public class AppLovinMAX
     // NOTE: Do not update signature as some integrations depend on it via Java reflection
     private MaxRewardedAd retrieveRewardedAd(String adUnitId)
     {
-        MaxRewardedAd result = mRewardedAds.get( adUnitId );
-        if ( result == null )
-        {
-            result = MaxRewardedAd.getInstance( adUnitId, sdk, getCurrentActivity() );
-            result.setListener( this );
-            result.setRevenueListener( this );
-
-            mRewardedAds.put( adUnitId, result );
-        }
-
-        return result;
+        return rewardedOperations.retrieve( adUnitId );
     }
 
     // NOTE: Do not update signature as some integrations depend on it via Java reflection
@@ -1721,15 +1809,18 @@ public class AppLovinMAX
                 }
             }
 
+            bannerOperations.beforeCreate( adUnitId );
             result = new MaxAdView( adUnitId, adFormat, builder.build() );
-            result.setListener( this );
-            result.setRevenueListener( this );
+            BannerViewListener bannerListener = new BannerViewListener(this, result, bannerOperations.managed(adUnitId));
+            result.setListener( bannerListener );
+            result.setRevenueListener( bannerListener );
 
             mAdViews.put( adUnitId, result );
             mAdViewPositions.put( adUnitId, adViewPosition );
 
             // Allow pubs to pause auto-refresh immediately, by default.
             result.setExtraParameter( "allow_pause_auto_refresh_immediately", "true" );
+            bannerOperations.bind(adUnitId, result, adFormat, isAdaptive);
         }
 
         return result;
@@ -2009,11 +2100,13 @@ public class AppLovinMAX
         }
         else if ( adFormat == MaxAdFormat.REWARDED )
         {
+            rewardedOperations.requireUncoordinated( adUnitId );
             MaxRewardedAd rewardedAd = retrieveRewardedAd( adUnitId );
             rewardedAd.setLocalExtraParameter( key, result );
         }
         else // MaxAdFormat.BANNER or MaxAdFormat.MREC
         {
+            if (bannerOperations.managed(adUnitId)) throw new IllegalStateException("BANNER_RESERVED");
             MaxAdView adView = AppLovinMAXAdView.getInstance( adUnitId );
 
             if ( adView == null )
@@ -2115,6 +2208,27 @@ public class AppLovinMAX
     @Override
     public void onMethodCall(@NonNull MethodCall call, @NonNull Result result)
     {
+        // Sanitized diagnostics for opt-in banner operations. Ordinary banner behavior is unchanged.
+        String bannerId = call.argument("ad_unit_id");
+        if (bannerId != null && bannerOperations.managed(bannerId) &&
+            ("createBanner".equals(call.method) || "loadBanner".equals(call.method) ||
+             "showBanner".equals(call.method) || "destroyBanner".equals(call.method) ||
+             "startBannerAutoRefresh".equals(call.method))) {
+            try {
+                switch (call.method) {
+                    case "createBanner": createBanner(bannerId, call.argument("position"),
+                        Boolean.TRUE.equals(call.argument("is_adaptive"))); break;
+                    case "loadBanner": loadBanner(bannerId, call.argument("banner_attempt_id")); break;
+                    case "showBanner": showBanner(bannerId); break;
+                    case "destroyBanner": destroyBanner(bannerId); break;
+                    default: startBannerAutoRefresh(bannerId); break;
+                }
+                result.success(null);
+            } catch (Exception ignored) {
+                result.error("BANNER_OPERATION_REJECTED", "Banner view/cycle is not ready for this operation.", null);
+            }
+            return;
+        }
         if ( "initialize".equals( call.method ) )
         {
             String pluginVersion = call.argument( "plugin_version" );
@@ -2449,26 +2563,11 @@ public class AppLovinMAX
 
             result.success( null );
         }
-        else if ( "loadRewardedAd".equals( call.method ) )
+        else if ( "reserveRewardedAd".equals( call.method ) || "retireRewardedAd".equals( call.method )
+                || "loadRewardedAd".equals( call.method ) || "isRewardedAdReady".equals( call.method )
+                || "showRewardedAd".equals( call.method ) )
         {
-            String adUnitId = call.argument( "ad_unit_id" );
-            loadRewardedAd( adUnitId );
-
-            result.success( null );
-        }
-        else if ( "isRewardedAdReady".equals( call.method ) )
-        {
-            String adUnitId = call.argument( "ad_unit_id" );
-            isRewardedAdReady( adUnitId, result );
-        }
-        else if ( "showRewardedAd".equals( call.method ) )
-        {
-            String adUnitId = call.argument( "ad_unit_id" );
-            String placement = call.argument( "placement" );
-            String customData = call.argument( "custom_data" );
-            showRewardedAd( adUnitId, placement, customData );
-
-            result.success( null );
+            handleRewardedOperation( call, result );
         }
         else if ( "setRewardedAdExtraParameter".equals( call.method ) )
         {
@@ -2543,7 +2642,8 @@ public class AppLovinMAX
                                                    extraParameters,
                                                    localExtraParameters,
                                                    result,
-                                                   applicationContext );
+                                                   applicationContext,
+                                                   this );
         }
         else if ( "destroyWidgetAdView".equals( call.method ) )
         {
@@ -2601,6 +2701,7 @@ public class AppLovinMAX
     {
         reservationActivity = null;
         interstitialReservations.hostUnavailable();
+        rewardedOperations.hostUnavailable();
         cleanupRequestedInterstitials();
     }
 
@@ -2619,6 +2720,7 @@ public class AppLovinMAX
     {
         reservationActivity = null;
         interstitialReservations.hostUnavailable();
+        rewardedOperations.hostUnavailable();
         cleanupRequestedInterstitials();
     }
 

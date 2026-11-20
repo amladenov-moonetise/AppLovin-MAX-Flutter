@@ -30,6 +30,7 @@ public class AppLovinMAXAdView
     private final int                     adViewId;
 
     private final MethodChannel channel;
+    private final AppLovinMAX owner;
 
     // Returns an MaxAdView to support Amazon integrations. This method returns the first instance
     // that matches the Ad Unit ID, consistent with the behavior introduced when this feature was
@@ -64,9 +65,10 @@ public class AppLovinMAXAdView
                                            @Nullable final Map<String, Object> extraParameters,
                                            @Nullable final Map<String, Object> localExtraParameters,
                                            final Result result,
-                                           final Context context)
+                                           final Context context,
+                                           final AppLovinMAX owner)
     {
-        AppLovinMAXAdViewWidget preloadedWidget = new AppLovinMAXAdViewWidget( adUnitId, adFormat, isAdaptive, true, context );
+        AppLovinMAXAdViewWidget preloadedWidget = new AppLovinMAXAdViewWidget( adUnitId, adFormat, isAdaptive, true, context, owner );
         preloadedWidgetInstances.put( preloadedWidget.hashCode(), preloadedWidget );
 
         preloadedWidget.setPlacement( placement );
@@ -74,7 +76,7 @@ public class AppLovinMAXAdView
         preloadedWidget.setExtraParameters( extraParameters );
         preloadedWidget.setLocalExtraParameters( localExtraParameters );
 
-        preloadedWidget.loadAd();
+        preloadedWidget.initialLoad();
 
         result.success( preloadedWidget.hashCode() );
     }
@@ -113,15 +115,35 @@ public class AppLovinMAXAdView
                              @Nullable final Map<String, Object> extraParameters,
                              @Nullable final Map<String, Object> localExtraParameters,
                              final BinaryMessenger messenger,
-                             final Context context)
+                             final Context context,
+                             final AppLovinMAX owner)
     {
+        this.owner = owner;
         String uniqueChannelName = "applovin_max/adview_" + viewId;
         channel = new MethodChannel( messenger, uniqueChannelName );
         channel.setMethodCallHandler( (call, result) -> {
             if ( "startAutoRefresh".equals( call.method ) )
             {
+                if (widget.isCoordinated()) {
+                    result.error("BANNER_EXPLICIT_REFRESH_REQUIRED", "Prepare again before each publisher load.", null);
+                    return;
+                }
                 widget.setAutoRefreshEnabled( true );
                 result.success( null );
+            }
+            else if ( "destroy".equals( call.method ) )
+            {
+                if (preloadedWidgetInstances.containsValue(widget)) {
+                    result.error("BANNER_PRELOADED_VIEW", "Unmount then use the publisher preload-destroy API.", null);
+                    return;
+                }
+                dispose();
+                result.success(null);
+            }
+            else if ( "load".equals( call.method ) )
+            {
+                try { widget.loadAd(call.argument("banner_attempt_id")); result.success( null ); }
+                catch ( Exception ignored ) { result.error( "BANNER_NOT_PREPARED", "Banner load rejected by native view/cycle guard.", null ); }
             }
             else if ( "stopAutoRefresh".equals( call.method ) )
             {
@@ -135,6 +157,7 @@ public class AppLovinMAXAdView
         } );
 
         widget = preloadedWidgetInstances.get( adViewId );
+        if (widget != null) widget.requireMountOwner(owner);
         if ( widget != null )
         {
             // Attach the preloaded widget if possible, otherwise create a new one for the
@@ -150,7 +173,7 @@ public class AppLovinMAXAdView
             }
         }
 
-        widget = new AppLovinMAXAdViewWidget( adUnitId, adFormat, isAdaptiveBannerEnabled, context );
+        widget = new AppLovinMAXAdViewWidget( adUnitId, adFormat, isAdaptiveBannerEnabled, false, context, owner );
         this.adViewId = widget.hashCode();
         widgetInstances.put( this.adViewId, widget );
 
@@ -163,7 +186,7 @@ public class AppLovinMAXAdView
         widget.setAutoRefreshEnabled( isAutoRefreshEnabled );
 
         widget.attachAdView( this );
-        widget.loadAd();
+        widget.initialLoad();
     }
 
     /// Flutter Lifecycle Methods
@@ -213,6 +236,6 @@ public class AppLovinMAXAdView
 
     public void sendEvent(final String event, final Map<String, Object> params)
     {
-        AppLovinMAX.getInstance().fireCallback( event, params, channel );
+        owner.fireCallback( event, params, channel );
     }
 }
