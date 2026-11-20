@@ -1,0 +1,13 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    configurations.configureEach {
+        // Application-wide exclusion, not merely one transitive edge.
+        // Disabled ONLY for the operator's expected-failure duplicate probe.
+        if (!rootProject.hasProperty('checkpointADuplicateProbe')) {
+            exclude group: 'org.prebid', module: 'prebid-mobile-sdk-max-adapters'
+        }
+    }
+}

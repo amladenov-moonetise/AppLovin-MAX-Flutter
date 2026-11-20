@@ -1,0 +1,182 @@
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
+import java.util.zip.ZipFile
+
+plugins {
+    id 'com.android.application'
+    id 'dev.flutter.flutter-gradle-plugin'
+}
+
+android {
+    namespace 'com.moonetise.research.checkpointa'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.moonetise.research.checkpointa'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.0.1-checkpoint-a'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes {
+		debug {
+			minifyEnabled = false
+			shrinkResources = false
+		}
+		release {
+			minifyEnabled = false
+			shrinkResources = false
+		}
+	}
+}
+flutter { source '../..' }
+
+dependencies {
+    implementation project(':replacement')
+    implementation('com.applovin:applovin-sdk') { version { strictly '13.3.1' } }
+    implementation('org.prebid:prebid-mobile-sdk') { version { strictly '3.4.1' } }
+    constraints {
+        implementation('org.prebid:prebid-mobile-sdk-core') { version { strictly '3.4.1' } }
+    }
+    androidTestImplementation 'androidx.test:runner:1.7.0'
+    androidTestImplementation 'junit:junit:4.13.2'
+
+    // Expected-failure control. It must never be used for a positive result.
+    if (rootProject.hasProperty('checkpointADuplicateProbe')) {
+        runtimeOnly 'org.prebid:prebid-mobile-sdk-max-adapters:3.4.1'
+    }
+}
+
+tasks.register('verifyCheckpointAGraph') {
+    group = 'verification'
+    description = 'Checks official hosted Flutter plugin origin, locked SDKs and absence of upstream adapter.'
+    doLast {
+        if (rootProject.hasProperty('checkpointADuplicateProbe')) {
+            logger.lifecycle('NEGATIVE CONTROL: graph guard bypassed to expose the duplicate to AGP.')
+            return
+        }
+        def plugin = rootProject.findProject(':applovin_max')
+        if (plugin == null) throw new GradleException('Official applovin_max plugin was not included by Flutter.')
+        def origin = plugin.projectDir.canonicalPath.replace('\\', '/')
+        if (!origin.endsWith('/hosted/pub.dev/applovin_max-4.5.1/android')) {
+            throw new GradleException("Refusing non-hosted or forked MAX plugin: ${origin}")
+        }
+        def pluginPubspec = new File(plugin.projectDir.parentFile, 'pubspec.yaml').text
+        if (!(pluginPubspec =~ /(?m)^version:\s*4\.5\.1\s*$/).find()) {
+            throw new GradleException('Hosted MAX plugin pubspec is not version 4.5.1.')
+        }
+        // Pub's hosted origin and operator lockfile review establish provenance;
+        // this check is not a cryptographic audit of arbitrary cache tampering.
+        def components = configurations.debugRuntimeClasspath.incoming.resolutionResult.allComponents
+        def modules = components.collect { it.moduleVersion }.findAll { it != null }
+        def expected = [
+            'com.applovin:applovin-sdk': '13.3.1',
+            'org.prebid:prebid-mobile-sdk': '3.4.1',
+            'org.prebid:prebid-mobile-sdk-core': '3.4.1'
+        ]
+        expected.each { coordinate, version ->
+            def found = modules.findAll { "${it.group}:${it.name}" == coordinate }
+            if (found.size() != 1 || found[0].version != version) {
+                throw new GradleException("Unexpected ${coordinate} resolution: ${found}")
+            }
+        }
+        if (modules.any { it.group == 'org.prebid' && it.name == 'prebid-mobile-sdk-max-adapters' }) {
+            throw new GradleException('Upstream adapter is still present alongside the replacement.')
+        }
+        logger.lifecycle("CHECKPOINT_A_GRAPH_PASS: official plugin=${origin}; MAX=13.3.1; Prebid=3.4.1; upstream adapter absent")
+    }
+}
+tasks.named('preBuild').configure { dependsOn 'verifyCheckpointAGraph' }
+
+// Probe mode requests the upstream adapter alongside the project replacement.
+// Assembly success alone does not establish the resulting APK class count.
+// inspectCheckpointAProbeApk reports that count without artifact-view resolution.
+
+// Read class definitions, rather than merely finding a string somewhere in DEX.
+// The target descriptor is ASCII, so no general MUTF-8 decoder is necessary.
+def countAdapterDefinitions = { byte[] dex ->
+    def buffer = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN)
+    if (dex.length < 112 || dex[0] != 100 || dex[1] != 101 || dex[2] != 120) {
+        throw new GradleException('Not a standard DEX file')
+    }
+    int stringIds = buffer.getInt(0x3c)
+    int typeIds = buffer.getInt(0x44)
+    int classCount = buffer.getInt(0x60)
+    int classDefs = buffer.getInt(0x64)
+    int count = 0
+    for (int i = 0; i < classCount; i++) {
+        int typeIndex = buffer.getInt(classDefs + i * 32)
+        int stringIndex = buffer.getInt(typeIds + typeIndex * 4)
+        int offset = buffer.getInt(stringIds + stringIndex * 4)
+        while ((dex[offset++] & 0x80) != 0) { /* skip UTF-16 length ULEB128 */ }
+        int start = offset
+        while (dex[offset] != 0) offset++
+        def descriptor = new String(dex, start, offset - start, StandardCharsets.UTF_8)
+        if (descriptor == 'Lcom/applovin/mediation/adapters/PrebidMaxMediationAdapter;') count++
+    }
+    count
+}
+
+tasks.register('verifyCheckpointA') {
+    group = 'verification'
+    description = 'Assembles debug APK and requires exactly one adapter class definition across its DEX files.'
+    dependsOn 'assembleDebug', 'verifyCheckpointAGraph'
+    doLast {
+        if (rootProject.hasProperty('checkpointADuplicateProbe')) {
+            throw new GradleException('Negative control cannot produce a Checkpoint A PASS.')
+        }
+        def apk = layout.buildDirectory.file('outputs/apk/debug/app-debug.apk').get().asFile
+        if (!apk.isFile()) throw new GradleException("Missing APK: ${apk}")
+        int definitions = 0
+        int dexFiles = 0
+        new ZipFile(apk).withCloseable { zip ->
+            zip.entries().each { entry ->
+                if (entry.name ==~ /classes(\d+)?\.dex/) {
+                    dexFiles++
+                    zip.getInputStream(entry).withCloseable { input ->
+                        definitions += countAdapterDefinitions(input.bytes)
+                    }
+                }
+            }
+        }
+        if (dexFiles == 0 || definitions != 1) {
+            throw new GradleException("Expected one adapter definition; found ${definitions} in ${dexFiles} DEX files")
+        }
+        logger.lifecycle("CHECKPOINT_A_APK_PASS: adapter definitions=1; APK=${apk}")
+    }
+}
+
+tasks.register('inspectCheckpointAProbeApk') {
+    group = 'verification'
+    description = 'Reports adapter definitions in the probe APK; does not assert an AGP duplicate-check result.'
+    dependsOn 'assembleDebug'
+    doLast {
+        if (!rootProject.hasProperty('checkpointADuplicateProbe')) {
+            throw new GradleException('This inspection requires -PcheckpointADuplicateProbe.')
+        }
+        def apk = layout.buildDirectory.file('outputs/apk/debug/app-debug.apk').get().asFile
+        if (!apk.isFile()) throw new GradleException("Missing probe APK: ${apk}")
+        int definitions = 0
+        int dexFiles = 0
+        new ZipFile(apk).withCloseable { zip ->
+            zip.entries().each { entry ->
+                if (entry.name ==~ /classes(\d+)?\.dex/) {
+                    dexFiles++
+                    zip.getInputStream(entry).withCloseable { input ->
+                        int inDex = countAdapterDefinitions(input.bytes)
+                        definitions += inDex
+                        logger.lifecycle("PROBE_DEX_ADAPTER_DEFINITIONS: ${entry.name}=${inDex}")
+                    }
+                }
+            }
+        }
+        if (dexFiles == 0) throw new GradleException('Probe APK contains no standard DEX files.')
+        logger.lifecycle("PROBE_APK_ADAPTER_DEFINITIONS: ${definitions}; APK=${apk}")
+        logger.lifecycle('INSPECTION ONLY: this is not a Checkpoint A PASS or an AGP duplicate-check failure.')
+    }
+}
