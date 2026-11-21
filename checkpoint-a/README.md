@@ -12,15 +12,31 @@ and must remain untouched. No Asterise Core or Casualino application is included
 
 ## Status
 
-Source-level feasibility: YES. Operator reports the official dependency graph,
-positive APK definition count and two physical Android 10 tests passed. The original
-negative precheck and full probe assembly both succeeded. The positive packaging
-check still passes. The negative control remains INCONCLUSIVE until the actual
-probe APK definition count is known. Custom artifact-view diagnostics were removed;
-a separate APK inspection task now reuses the existing DEX parser.
+Checkpoint A is CLOSED for isolated packaging and direct class-construction research.
+The operator supplied these verified results, including physical Android 10 validation:
+
+| Check | Recorded result |
+| --- | --- |
+| Official hosted applovin_max 4.5.1 | Resolved successfully from pub.dev |
+| Native MAX 13.3.1 and Prebid SDK/Core 3.4.1 graph | Verified |
+| Normal debug APK | Exactly one replacement PrebidMaxMediationAdapter definition |
+| Physical Android 10 direct class-construction tests | Two tests passed |
+| Probe with the upstream adapter enabled | Two definitions: classes.dex=1, classes2.dex=1; classes3.dex through classes6.dex=0 |
+| Observed AGP probe build | BUILD SUCCESSFUL; did not reject the duplicate |
+| Actual MAX invocation through TestPBS | NOT TESTED |
+
+The negative control confirms a packaged duplicate-class hazard; it does not establish
+automatic AGP/D8 rejection. The exact internal AGP behavior is not fully explained.
+Custom artifact-view diagnostics were removed; the existing APK inspection task
+provided the reported definition counts.
+
+The replacement remains a TEST STUB, not a functional or publishable Prebid adapter.
+Packaging and direct construction do not validate MAX-mediated loading, bidding,
+rendering, initialization recovery or production callbacks. TestPBS invocation needs
+separate authorization. Checkpoint B has not started.
+
 Codex did not run Gradle, Flutter resolution, tests, Git commands, or device actions.
-A successful fixture result is not proof that MAX invoked this class for TestPBS.
-That requires a separately authorized mediation experiment.
+Preserve this isolated checkpoint and both protected release branches unchanged.
 
 Protected references supplied by the operator:
 - Asterise release/android-ads: 311cde2
@@ -79,9 +95,11 @@ Official Flutter source reference already inspected in Investigations 01–04:
 AppLovin/AppLovin-MAX-Flutter, release_4_5_1,
 applovin_max/android/build.gradle (MAX 13.3.1), and
 applovin_max/android/src/main/java/com/applovin/applovin_max/AppLovinMAX.java.
-No official package was found in the local hosted pub cache during fixture preparation.
-Operator resolution and the graph guard must establish its presence before a PASS.
-The fork checkout beside this fixture is not acceptable evidence of official-package compatibility.
+No official package was found in the local hosted pub cache during initial fixture
+preparation. The operator subsequently resolved official hosted 4.5.1 and reported
+CHECKPOINT_A_GRAPH_PASS with the plugin path:
+C:/Users/AMlad/AppData/Local/Pub/Cache/hosted/pub.dev/applovin_max-4.5.1/android.
+The fork checkout beside this fixture is not evidence of official-package compatibility.
 
 ## Dependency graph and replacement boundary
 
@@ -111,8 +129,9 @@ The isolated root build excludes ONLY
 org.prebid:prebid-mobile-sdk-max-adapters
 on every configuration in every fixture project. The replacement is an Android
 library project with a different Gradle identity and the ORIGINAL Java class name.
-It never depends on the fork, Asterise :asterise-max, or the original adapter JAR.
-The graph guard rejects an upstream adapter that survives exclusion.
+Normal mode does not depend on the fork, Asterise :asterise-max, or the original
+adapter JAR. The graph guard rejects an upstream adapter that survives exclusion.
+Probe mode deliberately disables that exclusion and adds the original adapter JAR.
 
 Existing development graph, read only:
 Asterise asterise-max/build.gradle.kts explicitly includes the original adapter and
@@ -123,10 +142,22 @@ Thus exclusion on just one dependency edge is insufficient in a future host.
 No protected build declaration was changed.
 
 Gradle resolves versions of one module; it does not replace an unrelated module
-merely because both contain the same Java class. If both adapter definitions enter
-the runtime classpath, AGP duplicate-class checking / D8 must fail.
+merely because both contain the same Java class. The observed probe packaged two
+adapter definitions in separate DEX files while AGP reported BUILD SUCCESSFUL.
+The earlier claim that AGP/D8 must automatically reject this collision was incorrect
+for the observed build. The exact AGP behavior is not fully explained; do not
+generalize this result to every variant or toolchain.
+
+Future integration MUST explicitly count definitions of
+com.applovin.mediation.adapters.PrebidMaxMediationAdapter across ALL classes*.dex
+in the final APK for each shipped artifact/variant and require exactly ONE.
+Reject zero or multiple definitions, regardless of dependency-graph checks,
+successful assembly or direct class loading. Counting a pre-shrink intermediate
+or one DEX file is insufficient. Checkpoint A verified the debug APK only;
+release/shrunk final APKs have not been validated.
+
 Resource packaging exclusions or pickFirst are not class replacement mechanisms.
-Reference: https://developer.android.com/build/dependency-resolution-errors
+General dependency guidance: https://developer.android.com/build/dependency-resolution-errors
 
 ## Operator preparation — isolated directory only
 
@@ -205,10 +236,16 @@ android/app/build/outputs/androidTest-results/connected/.
 
 ## Operator probe — inspect the packaged class definitions
 
-The operator reports that both checkDebugDuplicateClasses and full probe assembly
-succeeded. The earlier expectation of a standard AGP/D8 failure was not established.
-Do not infer that both requested class definitions reached the APK from the graph
-or assembly success alone.
+The operator ran the probe and reported BUILD SUCCESSFUL with:
+- PROBE_DEX_ADAPTER_DEFINITIONS: classes.dex=1
+- PROBE_DEX_ADAPTER_DEFINITIONS: classes2.dex=1
+- PROBE_DEX_ADAPTER_DEFINITIONS: classes3.dex through classes6.dex=0
+- PROBE_APK_ADAPTER_DEFINITIONS: 2
+
+Both requested definitions therefore reached the APK. Neither the intermediate
+duplicate check nor full assembly rejected this observed collision. This is a
+confirmed packaging hazard, not proof of safe runtime behavior or MAX mediation
+compatibility. The exact AGP internal behavior remains unresolved.
 
     & $gradle -p "$fixture/android" :app:inspectCheckpointAProbeApk -PcheckpointADuplicateProbe --rerun-tasks --no-build-cache --stacktrace
 
@@ -217,17 +254,18 @@ overwrite it. The task uses the existing DEX class_def parser and reports
 PROBE_DEX_ADAPTER_DEFINITIONS per DEX plus PROBE_APK_ADAPTER_DEFINITIONS total.
 It installs no artifact view or hooks into AGP's duplicate-check task.
 
-Interpretation:
-- Total 2: both definitions reached the APK despite assembly success; the earlier
-  assumption that this build pipeline necessarily rejects that collision is false.
-- Total 1: the intended collision did not reach the APK; artifact selection or
-  class inclusion needs further investigation.
-- Any other total or tooling failure: investigate; do not count as a negative PASS.
+Interpretation for any separately authorized rerun:
+- Total 2 reproduces the observed duplicate packaging hazard.
+- Total 1 does not reproduce the intended collision and needs investigation.
+- Other totals or tooling failures need investigation; a generic failure is not
+  evidence that AGP detected duplicate adapter classes.
 
 The task is inspection only: it neither manufactures an AGP duplicate-class error
-nor grants a Checkpoint A PASS. Codex did not run it. The upstream dependency in
-probe mode and its normal-mode exclusion remain unchanged. Do not use the probe
-property for positive/device verification.
+nor validates mediation invocation. Codex did not run it; results above are from
+the operator. The upstream dependency in probe mode and its normal-mode exclusion
+remain unchanged. Do not use the probe property for positive/device verification.
+Commands are retained as the acceptance procedure; closure does not authorize
+additional experiments or changes.
 
 Positive confirmation after the probe:
 
@@ -248,19 +286,24 @@ is part of this step.
 
 ## Acceptance criteria and limits
 
-PASS (packaging/class-loading subchecks only):
-- Exact official hosted Flutter 4.5.1 and strict native SDK versions verified.
-- Exactly one adapter definition in the assembled application APK.
-- No duplicate-class error in positive build.
-- Device class lookup, constructor invocation, superclass/interfaces and signatures pass.
-- Expected duplicate-class failure in the negative control.
-- No fork dependency and no protected changes.
+Closed acceptance record (packaging/direct class loading only):
+- Official hosted Flutter 4.5.1 and native MAX 13.3.1 / Prebid 3.4.1 verified.
+- Normal debug assembly succeeded with exactly one replacement adapter definition.
+- Two physical Android 10 construction/signature tests passed.
+- The probe demonstrably packaged two definitions; automatic duplicate rejection
+  was NOT observed and is not an acceptance requirement supported by this result.
+- No MAX fork dependency is required by the fixture. Protected references and
+  branch boundaries remain unchanged by this documentation closure.
 
-FAIL: wrong versions, surviving original adapter, multiple definitions, incompatible
-entry points, construction/linkage failure, fork dependency, or protected edits.
+For future integration, wrong pins, an unintended upstream adapter, a final normal
+APK definition count other than one, incompatible entry points, construction/linkage
+failure, fork dependence or protected edits fail packaging acceptance. The probe's
+intentional two-definition APK is evidence of the hazard, not an integration artifact.
 
-INCONCLUSIVE: missing dependencies/toolchain/device, commands not run, or failure
-unrelated to the property being tested.
+Actual MAX invocation through TestPBS remains NOT TESTED. Rendering, live demand,
+revenue/reward forwarding and production runtime behavior are not validated by the
+stub. Missing runtime evidence must not be reported as a mediation PASS.
+The exact AGP behavior allowing the observed duplicate remains unexplained.
 
 Source-level same-class replacement is feasible without an official Flutter plugin
 patch or a renamed adapter. It creates no second MAX network or ladder.
