@@ -1,0 +1,34 @@
+plugins { id 'com.android.library' }
+
+group = 'com.moonetise.research'
+version = '0.0.1-checkpoint-b3-NOT-PRODUCTION'
+
+android {
+    namespace 'com.moonetise.research.adapterfixture'
+    compileSdk 35
+    buildFeatures { buildConfig = true }
+    defaultConfig {
+        minSdk 26
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // Host supplies the sole MAX runtime.
+    compileOnly('com.applovin:applovin-sdk:13.3.1') {
+        version { strictly '13.3.1' }
+    }
+    implementation('org.prebid:prebid-mobile-sdk:3.4.1') {
+        version { strictly '3.4.1' }
+    }
+    testImplementation 'junit:junit:4.13.2'
+    constraints {
+        implementation('org.prebid:prebid-mobile-sdk-core:3.4.1') {
+            version { strictly '3.4.1' }
+        }
+    }
+}
