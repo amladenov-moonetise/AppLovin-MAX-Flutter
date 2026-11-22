@@ -1,0 +1,32 @@
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+android/.gradle/
+android/local.properties
+android/**/build/
+*.jsonl
+*.log
+
+# Generated research outputs and install packages
+**/.cxx/
+**/build/
+**/.gradle/
+**/local.properties
+*.apk
+*.aab
+*.apks
+
+# Machine-local IDE and signing files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+**/key.properties
+*.jks
+*.keystore
+
+# Retain the dependency lock despite the parent repository's *.lock rule.
+!pubspec.lock

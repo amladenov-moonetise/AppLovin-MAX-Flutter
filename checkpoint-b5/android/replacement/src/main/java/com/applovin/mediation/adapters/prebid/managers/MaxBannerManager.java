@@ -1,0 +1,113 @@
+/* Prebid MAX adapter 3.4.1, Apache-2.0. Moonetise B5: cache/disposal diagnostics and sanitized errors only. */
+package com.applovin.mediation.adapters.prebid.managers;
+
+import android.app.Activity;
+import android.util.Log;
+import android.view.View;
+
+import androidx.annotation.Nullable;
+
+import com.applovin.mediation.MaxAdFormat;
+import com.applovin.mediation.adapter.MaxAdapterError;
+import com.applovin.mediation.adapter.listeners.MaxAdViewAdapterListener;
+import com.applovin.mediation.adapter.parameters.MaxAdapterResponseParameters;
+import com.applovin.mediation.adapters.prebid.ListenersCreator;
+import com.applovin.mediation.adapters.prebid.ParametersChecker;
+
+import org.prebid.mobile.LogUtil;
+import org.prebid.mobile.api.data.AdFormat;
+import org.prebid.mobile.api.rendering.PrebidDestroyable;
+import org.prebid.mobile.configuration.AdUnitConfiguration;
+import org.prebid.mobile.rendering.bidding.data.bid.BidResponse;
+import org.prebid.mobile.rendering.bidding.display.MediationBannerView;
+import org.prebid.mobile.rendering.bidding.listeners.DisplayViewListener;
+
+public class MaxBannerManager {
+
+    private static final String TAG = MaxBannerManager.class.getSimpleName();
+
+    @Nullable
+    private View adView;
+    @Nullable
+    private MaxAdViewAdapterListener maxListener;
+
+    public void loadAd(
+            MaxAdapterResponseParameters parameters,
+            MaxAdFormat maxAdFormat,
+            Activity activity,
+            MaxAdViewAdapterListener listener
+    ) {
+        maxListener = listener;
+
+        String responseId = ParametersChecker.getResponseIdAndCheckKeywords(parameters, this::onError);
+        BidResponse bidResponse = ParametersChecker.getBidResponse(responseId, this::onError);
+        if (bidResponse == null) {
+            return;
+        }
+
+        com.moonetise.research.b5.B5Trace.record(
+                com.moonetise.research.b5.B5Trace.Event.CACHE_POP,
+                com.moonetise.research.b5.B5Trace.Result.CONSUMED,
+                com.moonetise.research.b5.B5Trace.Category.NONE);
+        switch (maxAdFormat.getLabel()) {
+            case "BANNER":
+            case "MREC":
+                showBanner(activity, parameters, bidResponse);
+                break;
+            default:
+                String error = "Unknown type of MAX ad!";
+                Log.e(TAG, error);
+                onError(1005, error);
+        }
+    }
+
+    public void destroy() {
+        if (adView instanceof PrebidDestroyable) {
+            ((PrebidDestroyable) adView).destroy();
+        }
+        adView = null;
+        com.moonetise.research.b5.B5Trace.record(
+                com.moonetise.research.b5.B5Trace.Event.BANNER_MANAGER_DESTROYED,
+                com.moonetise.research.b5.B5Trace.Result.SUCCESS,
+                com.moonetise.research.b5.B5Trace.Category.NONE);
+    }
+
+
+    private void showBanner(
+            Activity activity,
+            MaxAdapterResponseParameters parameters,
+            BidResponse response
+    ) {
+        AdUnitConfiguration adConfiguration = new AdUnitConfiguration();
+        adConfiguration.setAdFormat(AdFormat.BANNER);
+        DisplayViewListener listener = ListenersCreator.createBannerListener(
+                maxListener,
+                () -> {
+                    if (maxListener != null) {
+                        maxListener.onAdViewAdLoaded(adView);
+                    }
+                }
+        );
+
+        if (activity != null) {
+            // No placement identifiers or raw cache errors enter research logs.
+            activity.runOnUiThread(() -> {
+                adView = new MediationBannerView(activity, listener, adConfiguration, response);
+            });
+        } else {
+            onError(1005, "Activity is null");
+        }
+    }
+
+    private void onError(
+            int code,
+            String error
+    ) {
+        if (maxListener != null) {
+            maxListener.onAdViewAdLoadFailed(new MaxAdapterError(code, "Prepared banner response unavailable"));
+        } else {
+            Log.e(TAG, "Max banner listener is null");
+        }
+    }
+
+}
