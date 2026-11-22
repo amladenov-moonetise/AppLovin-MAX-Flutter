@@ -1,0 +1,168 @@
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
+import java.util.zip.ZipFile
+import com.android.build.api.artifact.SingleArtifact
+
+plugins {
+    id 'com.android.application'
+    id 'dev.flutter.flutter-gradle-plugin'
+}
+android {
+    namespace = 'com.moonetise.research.checkpointb4'
+    compileSdk = 35
+    defaultConfig {
+        applicationId = 'com.moonetise.asterise.sample'
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = '0.0.1-checkpoint-b4'
+        testInstrumentationRunner = 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    buildFeatures { buildConfig = true }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    buildTypes {
+        debug { minifyEnabled = false; shrinkResources = false }
+        release {
+            debuggable = false
+            minifyEnabled = true
+            shrinkResources = false
+            // Local research signing ONLY. No production keystore or password is embedded.
+            signingConfig = signingConfigs.debug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+    }
+}
+flutter { source '../..' }
+dependencies {
+    implementation project(':replacement')
+    implementation('com.applovin:applovin-sdk') { version { strictly '13.3.1' } }
+    implementation('org.prebid:prebid-mobile-sdk') { version { strictly '3.4.1' } }
+    constraints {
+        implementation('org.prebid:prebid-mobile-sdk-core') { version { strictly '3.4.1' } }
+    }
+    androidTestImplementation 'androidx.test:runner:1.7.0'
+    androidTestImplementation 'junit:junit:4.13.2'
+}
+// Resolve only from an execution-time, explicitly named variant configuration.
+def verifyGraph = { String variant ->
+    def plugin = rootProject.findProject(':applovin_max')
+    if (plugin == null) throw new GradleException('Official Flutter MAX missing')
+    def origin = plugin.projectDir.canonicalPath.replace('\\', '/')
+    if (!origin.endsWith('/hosted/pub.dev/applovin_max-4.5.1/android'))
+        throw new GradleException('Non-hosted/forked MAX refused')
+    def spec = new File(plugin.projectDir.parentFile, 'pubspec.yaml').text
+    if (!(spec =~ /(?m)^version:\s*4\.5\.1\s*$/).find())
+        throw new GradleException('Wrong Flutter MAX version')
+    def modules = configurations.getByName("${variant}RuntimeClasspath").incoming.resolutionResult
+            .allComponents.collect { it.moduleVersion }.findAll { it != null }
+    ['com.applovin:applovin-sdk':'13.3.1',
+     'org.prebid:prebid-mobile-sdk':'3.4.1',
+     'org.prebid:prebid-mobile-sdk-core':'3.4.1'].each { coordinate, expected ->
+        def found = modules.findAll { "${it.group}:${it.name}" == coordinate }
+        if (found.size() != 1 || found[0].version != expected)
+            throw new GradleException("Wrong ${coordinate} graph")
+    }
+    if (modules.any { it.group == 'org.prebid' && it.name == 'prebid-mobile-sdk-max-adapters' })
+        throw new GradleException('Upstream Prebid adapter is present')
+    logger.lifecycle("CHECKPOINT_B4_${variant.toUpperCase()}_GRAPH_PASS: MAX=13.3.1; Prebid=3.4.1; upstream absent")
+}
+def countDefinitions = { byte[] dex, String wanted ->
+    def buffer = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN)
+    if (dex.length < 112 || dex[0] != 100 || dex[1] != 101 || dex[2] != 120) {
+        throw new GradleException('Not a standard DEX file')
+    }
+    int stringIds = buffer.getInt(0x3c)
+    int typeIds = buffer.getInt(0x44)
+    int classCount = buffer.getInt(0x60)
+    int classDefs = buffer.getInt(0x64)
+    int count = 0
+    for (int i = 0; i < classCount; i++) {
+        int typeIndex = buffer.getInt(classDefs + i * 32)
+        int stringIndex = buffer.getInt(typeIds + typeIndex * 4)
+        int offset = buffer.getInt(stringIds + stringIndex * 4)
+        while ((dex[offset++] & 0x80) != 0) { /* skip UTF-16 length ULEB128 */ }
+        int start = offset
+        while (dex[offset] != 0) offset++
+        def descriptor = new String(dex, start, offset - start, StandardCharsets.UTF_8)
+        if (descriptor == wanted) count++
+    }
+    count
+}
+
+
+androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+    def name = variant.name
+    if (!(name in ['debug', 'release'])) return
+    def cap = name.capitalize()
+    def graph = tasks.register("verifyCheckpointB4${cap}Graph") {
+        group = 'verification'
+        doLast { verifyGraph(name) }
+    }
+    tasks.matching { it.name == "pre${cap}Build" }.configureEach { dependsOn graph }
+    def mergedManifest = variant.artifacts.get(SingleArtifact.MERGED_MANIFEST.INSTANCE)
+    def verification = tasks.register("verifyCheckpointB4${cap}") {
+        group = 'verification'
+        description = "Verify ${name} graph, manifest and all final APK class definitions"
+        dependsOn "assemble${cap}", graph
+        inputs.file(mergedManifest)
+        doLast {
+            def apk = layout.buildDirectory.file("outputs/apk/${name}/app-${name}.apk").get().asFile
+            if (!apk.isFile()) throw new GradleException('Final APK missing')
+            int definitions = 0
+            int dexFiles = 0
+            def required = [
+                'Lcom/applovin/mediation/adapters/prebid/managers/MaxRewardedManager;',
+                'Lorg/prebid/mobile/rendering/bidding/display/PluginRendererFactory;',
+                'Lorg/prebid/mobile/rendering/bidding/display/InterstitialController;'
+            ].collectEntries { [(it): 0] }
+            boolean syntheticFixturePresent = false
+            new ZipFile(apk).withCloseable { zip ->
+                zip.entries().each { entry ->
+                    if (entry.name ==~ /classes(\d+)?\.dex/) {
+                        dexFiles++
+                        zip.getInputStream(entry).withCloseable { input ->
+                            byte[] bytes = input.bytes
+                            definitions += countDefinitions(bytes, 'Lcom/applovin/mediation/adapters/PrebidMaxMediationAdapter;')
+                            required.keySet().each { descriptor -> required[descriptor] += countDefinitions(bytes, descriptor) }
+                            if (new String(bytes, StandardCharsets.ISO_8859_1)
+                                    .contains('moonetise-test-video-rewarded-3usd'))
+                                syntheticFixturePresent = true
+                        }
+                    }
+                }
+            }
+            if (dexFiles == 0 || definitions != 1)
+                throw new GradleException("Expected exactly one adapter; found ${definitions}")
+            if (name == 'debug' && required.values().any { it != 1 })
+                throw new GradleException('Required original rewarded manager/controller missing or duplicated')
+            if (name == 'release') {
+                def factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                factory.setNamespaceAware(true)
+                def doc = factory.newDocumentBuilder().parse(mergedManifest.get().asFile)
+                def app = doc.getElementsByTagName('application').item(0)
+                if (app.getAttributeNS('http://schemas.android.com/apk/res/android', 'debuggable') == 'true')
+                    throw new GradleException('Release manifest is debuggable')
+                if (syntheticFixturePresent) throw new GradleException('Synthetic fixture leaked into release DEX')
+                def mapping = layout.buildDirectory.file('outputs/mapping/release/mapping.txt').get().asFile
+                def config = layout.buildDirectory.file('outputs/mapping/release/configuration.txt').get().asFile
+                if (!mapping.isFile() || !config.isFile()) throw new GradleException('R8 reports missing')
+                if (!(mapping.text =~ /(?m)^com\.applovin\.mediation\.adapters\.PrebidMaxMediationAdapter -> com\.applovin\.mediation\.adapters\.PrebidMaxMediationAdapter:$/).find())
+                    throw new GradleException('Adapter runtime identity not retained')
+                if (!config.text.contains('com.applovin.mediation.adapters.PrebidMaxMediationAdapter'))
+                    throw new GradleException('Adapter keep rule missing from merged R8 configuration')
+            }
+            logger.lifecycle("CHECKPOINT_B4_${name.toUpperCase()}_APK_PASS: adapter definitions=1; APK=${apk}")
+        }
+    }
+    tasks.matching { it.name == "install${cap}" }.configureEach {
+        dependsOn verification
+        doFirst {
+            if (providers.gradleProperty('b4AcknowledgeSampleReplacement').orNull != 'YES')
+                throw new GradleException('STOP: obtain fresh acknowledgement before replacing com.moonetise.asterise.sample; then pass -Pb4AcknowledgeSampleReplacement=YES')
+        }
+    }
+}
